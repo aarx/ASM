@@ -1,0 +1,238 @@
+import subprocess
+import os
+import csv
+import socket
+import argparse
+import json
+import requests
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+FAST_TOOLS = [
+    ["subfinder", "-d"],
+    ["assetfinder", "--subs-only"],
+    ["findomain", "-t"]
+]
+
+DEEP_TOOLS = [
+    ["amass", "enum", "-passive", "-norecursive", "-d"]
+]
+
+HTTPX_BINARY = os.path.expanduser("~/go/bin/httpx")
+HTTPX_ARGS = [HTTPX_BINARY, "-silent", "-json"]
+
+KNOWN_DOMAINS_FILE = "known_domains.csv"
+
+
+# ==============================
+# HELPERS
+# ==============================
+
+def run_tool(cmd):
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return result.stdout.splitlines()
+    except:
+        return []
+
+
+def resolve_ip(domain):
+    try:
+        return socket.gethostbyname(domain)
+    except:
+        return ""
+
+
+def resolve_reverse_dns(ip):
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except:
+        return "N/A"
+
+
+# ==============================
+# LIGHT CT EXPANSION
+# ==============================
+
+def ct_expand(brand):
+    print(f"[+] Running light CT expansion for brand: {brand}")
+
+    expanded_domains = set()
+
+    try:
+        url = f"https://crt.sh/?q=%25{brand}%25&output=json"
+        response = requests.get(url, timeout=20)
+
+        if response.status_code != 200:
+            return expanded_domains
+
+        data = response.json()
+
+        for entry in data:
+            name_value = entry.get("name_value", "")
+            domains = name_value.split("\n")
+
+            for domain in domains:
+                domain = domain.lower().strip()
+
+                # Basic filtering
+                if brand not in domain:
+                    continue
+
+                if len(domain) > len(brand) + 20:
+                    continue
+
+                if not re.match(r"^[a-z0-9.-]+$", domain):
+                    continue
+
+                expanded_domains.add(domain)
+
+    except Exception as e:
+        print(f"[!] CT expansion error: {e}")
+
+    print(f"[+] CT Expansion Found: {len(expanded_domains)} related domains")
+    return expanded_domains
+
+
+# ==============================
+# MAIN
+# ==============================
+
+def main(target, mode, expand):
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_dir = f"recon_{target}_{timestamp}"
+    os.makedirs(base_dir, exist_ok=True)
+
+    print(f"[+] Starting Recon for {target}")
+    print(f"[+] Mode: {mode}")
+
+    tools = FAST_TOOLS.copy()
+    if mode == "deep":
+        tools += DEEP_TOOLS
+
+    all_domains = set()
+
+    # 1️⃣ ENUMERATION
+    for tool in tools:
+        cmd = tool + [target]
+        print(f"[+] Running: {' '.join(cmd)}")
+        output = run_tool(cmd)
+
+        for line in output:
+            line = line.strip()
+            if line and "." in line:
+                all_domains.add(line.lower())
+
+    # 2️⃣ LIGHT EXPANSION
+    if expand:
+        brand = target.split(".")[0]
+        expanded = ct_expand(brand)
+        all_domains.update(expanded)
+
+    print(f"[+] Total Unique Domains After Expansion: {len(all_domains)}")
+
+    if not all_domains:
+        print("[!] No domains found.")
+        return
+
+    domains_file = os.path.join(base_dir, "all_domains.txt")
+    with open(domains_file, "w") as f:
+        for domain in sorted(all_domains):
+            f.write(domain + "\n")
+
+    # 3️⃣ HTTPX ENRICHMENT
+    print("[+] Running httpx enrichment...")
+    httpx_cmd = HTTPX_ARGS + ["-l", domains_file]
+    httpx_output = run_tool(httpx_cmd)
+
+    live_data = {}
+
+    for line in httpx_output:
+        try:
+            data = json.loads(line)
+            url = data.get("url", "")
+            status = data.get("status-code", "")
+            title = data.get("title", "")
+            ip = data.get("ip", "")
+
+            if not url:
+                continue
+
+            domain = url.replace("https://", "").replace("http://", "").split("/")[0]
+            live_data[domain.lower()] = {
+                "status": status,
+                "title": title,
+                "ip": ip
+            }
+
+        except:
+            continue
+
+    # 4️⃣ LOAD KNOWN DOMAINS
+    known_domains = set()
+    if os.path.exists(KNOWN_DOMAINS_FILE):
+        with open(KNOWN_DOMAINS_FILE, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                known_domains.add(row["Domains"].strip().lower())
+
+    # 5️⃣ FINAL CSV
+    final_csv = os.path.join(base_dir, "final_output.csv")
+
+    print("[+] Generating final CSV...")
+
+    with open(final_csv, "w", newline="", encoding="utf-8") as csvfile:
+        fieldnames = ["Domain", "IP", "Reverse_DNS", "HTTP_Status", "Title", "Domain_Status"]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+
+        def process_domain(domain):
+
+            domain = domain.lower()
+            ip = ""
+            status = "No HTTP"
+            title = ""
+
+            if domain in live_data:
+                status = live_data[domain]["status"]
+                title = live_data[domain]["title"]
+                ip = live_data[domain]["ip"]
+
+            if not ip:
+                ip = resolve_ip(domain)
+
+            reverse_dns = resolve_reverse_dns(ip) if ip else "N/A"
+            domain_status = "Known" if domain in known_domains else "New"
+
+            return {
+                "Domain": domain,
+                "IP": ip,
+                "Reverse_DNS": reverse_dns,
+                "HTTP_Status": status,
+                "Title": title,
+                "Domain_Status": domain_status
+            }
+
+        with ThreadPoolExecutor(max_workers=40) as executor:
+            futures = [executor.submit(process_domain, d) for d in all_domains]
+            for future in as_completed(futures):
+                writer.writerow(future.result())
+
+    print("[+] Recon Completed Successfully.")
+    print(f"[+] Output directory: {base_dir}")
+
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(description="External Recon Automation Tool")
+    parser.add_argument("target")
+    parser.add_argument("--deep", action="store_true")
+    parser.add_argument("--expand", action="store_true")
+
+    args = parser.parse_args()
+
+    mode = "deep" if args.deep else "fast"
+
+    main(args.target, mode, args.expand)
