@@ -349,21 +349,39 @@ def main(seed_file, deep, expand):
             f.write(d+"\n")
 
     print("[+] Resolving IPs")
-
-    total = len(domain_registry)  # DEBUG
-    for i, d in enumerate(domain_registry):  # DEBUG
-
-        if i % 500 == 0:  # DEBUG
-            debug(f"IP resolution progress: {i}/{total}")  # DEBUG
-
-        ip = resolve_ip(d)
-
-        domain_registry[d]["ip"] = ip
-
+    
+    domains = list(domain_registry.keys())
+    total = len(domains)
+    
+    def resolve_domain(domain):
+    
+        ip = resolve_ip(domain)
+    
         if ip:
-            domain_registry[d]["reverse_dns"] = reverse_dns(ip)
+            rdns = reverse_dns(ip)
         else:
-            domain_registry[d]["reverse_dns"] = "N/A"
+            rdns = "N/A"
+    
+        return domain, ip, rdns
+    
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
+    
+        futures = {exe.submit(resolve_domain, d): d for d in domains}
+    
+        completed = 0
+    
+        for f in as_completed(futures):
+    
+            completed += 1
+    
+            if completed % 500 == 0:
+                debug(f"IP resolution progress: {completed}/{total}")
+    
+            domain, ip, rdns = f.result()
+    
+            domain_registry[domain]["ip"] = ip
+            domain_registry[domain]["reverse_dns"] = rdns
 
     print("[+] HTTP probing")
 
