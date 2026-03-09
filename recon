@@ -11,6 +11,13 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==============================
+# DEBUG HELPER
+# ==============================
+
+def debug(msg):  # DEBUG
+    print(f"[DEBUG] {msg}")  # DEBUG
+
+# ==============================
 # CONFIG
 # ==============================
 
@@ -50,7 +57,6 @@ def add_domain(domain, source, seed):
     if not domain or "." not in domain:
         return
 
-    # update source stats
     source_stats[source] = source_stats.get(source, 0) + 1
 
     if domain not in domain_registry:
@@ -86,10 +92,20 @@ def normalize_domain(d):
 
 def run_tool(cmd):
 
+    debug(f"Executing tool: {' '.join(cmd)}")  # DEBUG
+
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
-        return result.stdout.splitlines()
-    except:
+
+        lines = result.stdout.splitlines()
+
+        debug(f"Tool finished: {' '.join(cmd)} | results: {len(lines)}")  # DEBUG
+
+        return lines
+    except Exception as e:
+
+        debug(f"Tool failed: {' '.join(cmd)} | error: {e}")  # DEBUG
+
         return []
 
 
@@ -114,7 +130,11 @@ def run_subdomain_enum(seed, deep):
 
         print(f"[+] Running {name} on {seed}")
 
+        debug(f"Starting tool {name} for seed {seed}")  # DEBUG
+
         results = run_tool(cmd + [seed])
+
+        debug(f"{name} discovered {len(results)} domains")  # DEBUG
 
         for d in results:
             add_domain(d, name, seed)
@@ -126,25 +146,23 @@ def run_subdomain_enum(seed, deep):
 
 def brand_expand(seed):
 
+    debug(f"Running brand expansion for {seed}")  # DEBUG
+
     brand = extract_brand(seed)
 
-    # TLD variants
     for tld in COMMON_TLDS:
 
         d = f"{brand}.{tld}"
         add_domain(d, "brand_tld", seed)
 
-    # prefix patterns
     for p in PREFIX_PATTERNS:
 
         d = f"{p}{brand}.com"
         add_domain(d, "brand_pattern", seed)
-    
-        # new: hyphen prefix
+
         d2 = f"{p}-{brand}.com"
         add_domain(d2, "brand_pattern", seed)
 
-    # suffix patterns
     for s in SUFFIX_PATTERNS:
 
         d = f"{brand}{s}.com"
@@ -153,12 +171,16 @@ def brand_expand(seed):
         d2 = f"{brand}-{s}.com"
         add_domain(d2, "brand_pattern", seed)
 
+    debug(f"Brand expansion completed for {seed}")  # DEBUG
+
 
 # ==============================
 # CT EXPANSION
 # ==============================
 
 def ct_expand(seed):
+
+    debug(f"Running CT expansion for {seed}")  # DEBUG
 
     brand = extract_brand(seed)
 
@@ -184,8 +206,11 @@ def ct_expand(seed):
                 if brand in d:
                     add_domain(d,"brand_ct",seed)
 
-    except:
-        pass
+        debug(f"CT expansion completed for {seed}")  # DEBUG
+
+    except Exception as e:
+
+        debug(f"CT expansion failed for {seed} | {e}")  # DEBUG
 
 
 # ==============================
@@ -299,8 +324,6 @@ def main(seed_file, deep, expand):
             if s:
                 seeds.append(s)
 
-    # --------------------------
-
     for seed in seeds:
 
         print(f"\n[+] Processing seed: {seed}")
@@ -311,14 +334,13 @@ def main(seed_file, deep, expand):
             brand_expand(seed)
             ct_expand(seed)
 
-    # --------------------------
     print(f"\n[+] Total domains discovered: {len(domain_registry)}")
+
     print("\n[+] Discovery source summary\n")
 
     for src, count in sorted(source_stats.items(), key=lambda x: x[1], reverse=True):
         print(f"{src:15} : {count}")
 
-    # Save domain list
     all_domains_file = os.path.join(outdir,"all_domains.txt")
 
     with open(all_domains_file,"w") as f:
@@ -326,10 +348,13 @@ def main(seed_file, deep, expand):
         for d in sorted(domain_registry.keys()):
             f.write(d+"\n")
 
-    # --------------------------
     print("[+] Resolving IPs")
 
-    for d in domain_registry:
+    total = len(domain_registry)  # DEBUG
+    for i, d in enumerate(domain_registry):  # DEBUG
+
+        if i % 500 == 0:  # DEBUG
+            debug(f"IP resolution progress: {i}/{total}")  # DEBUG
 
         ip = resolve_ip(d)
 
@@ -340,12 +365,13 @@ def main(seed_file, deep, expand):
         else:
             domain_registry[d]["reverse_dns"] = "N/A"
 
-    # --------------------------
     print("[+] HTTP probing")
 
     domains_with_ip = [
         d for d in domain_registry if domain_registry[d]["ip"]
     ]
+
+    debug(f"Starting HTTP probing for {len(domains_with_ip)} domains")  # DEBUG
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
 
@@ -354,7 +380,14 @@ def main(seed_file, deep, expand):
             for d in domains_with_ip
         }
 
+        completed = 0  # DEBUG
+
         for f in as_completed(futures):
+
+            completed += 1  # DEBUG
+
+            if completed % 200 == 0:  # DEBUG
+                debug(f"HTTP probes completed: {completed}/{len(domains_with_ip)}")  # DEBUG
 
             d = futures[f]
             r = f.result()
@@ -367,27 +400,16 @@ def main(seed_file, deep, expand):
                 domain_registry[d]["final_status"] = r["final_status"]
                 domain_registry[d]["title"] = r["title"]
 
-    # --------------------------
     known = load_known()
 
-    # --------------------------
     print("[+] Writing final CSV")
 
     csv_file = os.path.join(outdir,"final_output.csv")
 
     fields = [
-        "Domain",
-        "Source",
-        "Seed",
-        "IP",
-        "Reverse_DNS",
-        "HTTP_Status",
-        "HTTP_Reason",
-        "Redirect_Location",
-        "Final_URL",
-        "Final_Status",
-        "Title",
-        "Domain_Status"
+        "Domain","Source","Seed","IP","Reverse_DNS",
+        "HTTP_Status","HTTP_Reason","Redirect_Location",
+        "Final_URL","Final_Status","Title","Domain_Status"
     ]
 
     with open(csv_file,"w",newline="",encoding="utf-8") as f:
@@ -415,8 +437,6 @@ def main(seed_file, deep, expand):
 
     print(f"[+] Done. Output saved in {outdir}")
 
-
-# ==============================
 
 if __name__ == "__main__":
 
